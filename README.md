@@ -1,123 +1,70 @@
-# Zepto AI/ML Capstone
+# Support Assistant
 
-This project brings together three related parts of the capstone:
-
-1. Data pipeline: scraping, cleaning, normalization, and relational storage. See [data_pipeline/README.md](data_pipeline/README.md).
-2. Analytics pipeline: Titanic profiling, EDA, model building, and regression. See [analytics/README.md](analytics/README.md).
-3. Support assistant: a local RAG service for Zepto policy questions. See [support_assistant/README.md](support_assistant/README.md).
-
-The dependencies for all three parts are listed in the root `requirements.txt` file.
+This module is a small Zepto policy assistant. It searches the local policy files with sentence-transformer embeddings, stores the vectors in ChromaDB, and uses LangGraph to choose how to answer. Mock mode is on by default, so no API key is needed.
 
 ## Setup
 
+From the repo root:
+
 ```bash
-cd "c:/Users/vv033/capstone project"
 pip install -r requirements.txt
-```
-
-### Running on another laptop
-
-The project uses relative paths, so it can be copied to a different folder or computer. On a new laptop, install Python 3.11 or newer, open a terminal in the project folder, and run:
-
-```bash
-python -m venv .venv
-# Windows PowerShell
-.venv\Scripts\Activate.ps1
-# macOS/Linux
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-The first run needs internet access for the book website, the Titanic dataset download, and the `all-MiniLM-L6-v2` embedding model. Later support-assistant runs reuse the local model cache and ChromaDB files. The application does not need an API key when `MOCK_LLM` is left unset.
-
-Run the modules from the project root using the commands below. If the computer blocks compiled Python libraries with a security policy, the analytics script may need Python installed from the official Python installer or a virtual environment with permission to load native packages.
-
-## Module 1: Data pipeline
-
-```bash
-python data_pipeline/pipeline.py
-```
-
-This script collects books from four categories on books.toscrape.com, cleans the fields, converts the prices from GBP to INR using 1 GBP = 105.50 INR, and saves the results in `data_pipeline/zepto_books.db`.
-
-## Module 2: Analytics
-
-```bash
-python analytics/01_eda.py
-python analytics/02_modeling.py
-python analytics/reload_pipeline_check.py
-```
-
-The EDA script saves a local copy of the Titanic data, checks missing values and outliers, and creates the charts. The modeling script cleans the data, trains the classifiers and fare regressor, reports the metrics, and saves the selected pipeline to `analytics/best_model_pipeline.joblib`.
-
-## Module 3: Support assistant
-
-```bash
 cd support_assistant
 python main.py
 ```
 
-Then call the app with:
+Then call the local FastAPI app:
 
 ```bash
 curl -X POST http://127.0.0.1:7860/ask -H "Content-Type: application/json" -d '{"query":"What is the delivery fee below INR 149?"}'
 curl -X POST http://127.0.0.1:7860/ask -H "Content-Type: application/json" -d '{"query":"What is the capital of France?"}'
 ```
 
-The assistant stores local embeddings in ChromaDB and uses LangGraph to route questions. `MOCK_LLM` is enabled by default, so the example works without an API key or an external LLM call.
+The first request downloads `all-MiniLM-L6-v2` if it is not already cached. After that, the vectors are reused from the local `chroma_store` directory.
+
+## How it works
+
+The request follows this path:
+
+```text
+docs/*.txt
+	-> PolicyAssistant._bootstrap_collection()
+	-> SentenceTransformer("all-MiniLM-L6-v2")
+	-> ChromaDB collection: zepto_policies
+	-> classify_intent node
+	   -> policy_question: retrieve_and_answer node -> JSON response
+	   -> general_question: direct_answer node -> JSON response
+```
+
+1. **Ingestion:** `PolicyAssistant._bootstrap_collection()` reads the eight files under `support_assistant/docs`. Each document is used as one chunk and stored with its filename as the ChromaDB ID.
+2. **Embedding:** `SentenceTransformer("all-MiniLM-L6-v2")` embeds each document and each incoming query locally. ChromaDB stores the vectors in the persistent `zepto_policies` collection under `chroma_store`.
+3. **Retrieval:** the LangGraph `retrieve_and_answer` node embeds policy questions and asks ChromaDB for the top three matching documents.
+4. **Generation:** in the default mock mode, `retrieve_and_answer` returns the required `Based on the retrieved context: ...` response and `direct_answer` returns the fixed policy-only message. With `MOCK_LLM=0`, the retrieved context is inserted into `PROMPT_TEMPLATE` and passed to the optional real-LLM hook; its response is validated by `AnswerResponse`.
+
+The graph is built in `build_graph()` with three nodes: `classify_intent`, `retrieve_and_answer`, and `direct_answer`. A conditional edge sends `policy_question` to retrieval and `general_question` directly to the canned response. The keyword classifier and both mock answer branches make no LLM call when `MOCK_LLM` is unset or set to `1`.
+
+The response always follows the Pydantic schema `answer` (string), `sources` (list of document IDs), and `confidence` (0 to 1). The optional real-LLM answer path tries the initial prompt plus two corrective prompts when the returned JSON fails validation; after three failures it returns a marked error response with confidence `0.0`.
+
+`MOCK_LLM` controls the generation branch. Leave it unset, or set it to `1`, to use the local response path. Setting it to `0` selects the optional real-LLM path in the code.
+
+## Example responses (MOCK_LLM default)
+
+```json
+{"answer":"Based on the retrieved context: Zepto delivers grocery and household essentials to serviceable pin codes within 10 to 30 minutes ...","sources":["doc_01.txt","doc_03.txt","doc_05.txt"],"confidence":1.0}
+```
+
+```json
+{"answer":"I can only answer questions about Zepto policies right now.","sources":[],"confidence":1.0}
+```
 
 ## Docker
 
-The root-level Dockerfile packages the support assistant as a small local service.
+Build from the repository root so the image can copy the shared dependency file:
 
 ```bash
-docker build -t zepto-capstone .
-docker run --rm -p 7860:7860 zepto-capstone
+docker build -f support_assistant/Dockerfile -t zepto-support-assistant .
+docker run --rm -p 7860:7860 zepto-support-assistant
 ```
 
-Then call the app with:
+Then open `http://127.0.0.1:7860/docs` or send a `POST /ask` request as shown above. The root `Dockerfile` provides the same service with the shorter `docker build -t zepto-capstone .` command.
 
-```bash
-curl -X POST http://127.0.0.1:7860/ask -H "Content-Type: application/json" -d '{"query":"What is the delivery fee below INR 149?"}'
-```
-
-## Notes on the implementation
-
-- Data pipeline: four category pages are scraped, invalid rows are dropped, and the cleaned data is stored in two related SQLite tables.
-- Analytics: the Titanic data is saved locally and reused by the EDA and modeling scripts. The `alive` column is removed because it gives away the target.
-- Support assistant: the documents and embeddings stay local. Mock mode handles the answer generation by default.
-
-## Requirement checklist
-
-This is the checklist I used while building the project.
-
-| Requirement | Status | Where to check |
-|---|---|---|
-| Three modules at the repository root | Complete | Root folders |
-| One dependency file | Complete | `requirements.txt` |
-| Four categories and at least 60 records | Complete | `data_pipeline/pipeline.py` |
-| Cleaning, ratings, stock status, and currency conversion | Complete | `clean_books()` in `pipeline.py` |
-| Related SQLite tables | Complete | `categories` and `books` in `pipeline.py` |
-| SQL examples and SQL/pandas join comparison | Complete | `queries_output.txt` and `pipeline.py` |
-| Titanic EDA and cleaning | Complete | `analytics/01_eda.py` and `analytics/titanic.csv` |
-| Classification, imbalance handling, and tuning | Complete | `analytics/02_modeling.py` |
-| Fare regression and evaluation | Complete | `analytics/02_modeling.py` |
-| Saved model and reload check | Complete | `best_model_pipeline.joblib` and `reload_pipeline_check.py` |
-| Local policy RAG | Complete | `support_assistant/docs` and `support_assistant/main.py` |
-| LangGraph routing | Complete | `build_graph()` in `main.py` |
-| FastAPI `/ask` endpoint and JSON response | Complete | `AskRequest`, `AnswerResponse`, and `POST /ask` |
-| Mock mode | Complete | `MOCK_LLM` in `main.py` |
-| Docker support | Complete | `Dockerfile` |
-| Full local run | Verified on the current machine | Run the commands below |
-
-### Verification Commands
-
-```bash
-python data_pipeline/pipeline.py
-python analytics/01_eda.py
-python analytics/02_modeling.py
-python analytics/reload_pipeline_check.py
-python verify_project.py
-```
-
-The first run needs internet access for the book pages and the sentence-transformer model. After the model is downloaded, the support assistant can reuse the local ChromaDB store.
+The module Docker image starts Uvicorn directly on port 7860 and serves the same `/ask` endpoint as the local Python command.
